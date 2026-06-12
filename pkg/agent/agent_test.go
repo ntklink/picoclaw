@@ -4401,7 +4401,90 @@ func (p *visionUnsupportedMediaProvider) GetDefaultModel() string {
 	return "mock-fail-model"
 }
 
-func TestAgentLoop_VisionUnsupportedErrorStripsSessionMedia(t *testing.T) {
+type loadImagePlanningProvider struct {
+	path        string
+	followUpErr error
+	calls       int
+	models      []string
+}
+
+func (p *loadImagePlanningProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	p.models = append(p.models, model)
+
+	if p.calls == 1 {
+		return &providers.LLMResponse{
+			Content: "Let me inspect the image.",
+			ToolCalls: []providers.ToolCall{{
+				ID:        "call_load_image_test",
+				Type:      "function",
+				Name:      "load_image",
+				Arguments: map[string]any{"path": p.path},
+			}},
+		}, nil
+	}
+
+	if p.followUpErr != nil {
+		return nil, p.followUpErr
+	}
+
+	return nil, fmt.Errorf("load_image follow-up should not be handled by the text model")
+}
+
+func (p *loadImagePlanningProvider) GetDefaultModel() string {
+	return "load-image-planner"
+}
+
+type visionAnswerProvider struct {
+	calls     int
+	models    []string
+	mediaSeen []bool
+}
+
+func (p *visionAnswerProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	p.calls++
+	p.models = append(p.models, model)
+
+	hasMedia := false
+	for _, msg := range messages {
+		for _, ref := range msg.Media {
+			if strings.TrimSpace(ref) != "" {
+				hasMedia = true
+				break
+			}
+		}
+		if hasMedia {
+			break
+		}
+	}
+	p.mediaSeen = append(p.mediaSeen, hasMedia)
+	if !hasMedia {
+		return nil, fmt.Errorf("vision provider expected image media in follow-up request")
+	}
+
+	return &providers.LLMResponse{
+		Content:   "vision answer",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (p *visionAnswerProvider) GetDefaultModel() string {
+	return "vision-answer-model"
+}
+
+func TestAgentLoop_VisionUnsupportedErrorReturnsClearFailure(t *testing.T) {
 	workspace := t.TempDir()
 
 	cfg := &config.Config{
@@ -4436,17 +4519,20 @@ func TestAgentLoop_VisionUnsupportedErrorStripsSessionMedia(t *testing.T) {
 		Media:      []string{"data:image/png;base64,abc123"},
 		SessionKey: sessionKey,
 	}))
-	if err != nil {
-		t.Fatalf("processMessage() error = %v", err)
+	if err == nil {
+		t.Fatal("processMessage() error = nil, want vision unsupported failure")
 	}
-	if resp != "ok" {
-		t.Fatalf("response = %q, want %q", resp, "ok")
+	if resp != "" {
+		t.Fatalf("response = %q, want empty response on error", resp)
 	}
-	if provider.calls != 2 {
-		t.Fatalf("calls = %d, want %d (fail with media, then retry without media)", provider.calls, 2)
+	if !strings.Contains(err.Error(), `active model "test-model" does not support image input`) {
+		t.Fatalf("error = %q, want clear vision unsupported guidance", err.Error())
 	}
-	if !slices.Equal(provider.mediaSeen, []bool{true, false}) {
-		t.Fatalf("mediaSeen = %v, want %v", provider.mediaSeen, []bool{true, false})
+	if provider.calls != 1 {
+		t.Fatalf("calls = %d, want %d (no retry without media)", provider.calls, 1)
+	}
+	if !slices.Equal(provider.mediaSeen, []bool{true}) {
+		t.Fatalf("mediaSeen = %v, want %v", provider.mediaSeen, []bool{true})
 	}
 
 	agent := al.registry.GetDefaultAgent()
@@ -4454,37 +4540,161 @@ func TestAgentLoop_VisionUnsupportedErrorStripsSessionMedia(t *testing.T) {
 		t.Fatal("expected default agent")
 	}
 	history := agent.Sessions.GetHistory(sessionKey)
-	for i, msg := range history {
-		if len(msg.Media) > 0 {
-			t.Fatalf("history[%d].Media = %v, want no media after stripping", i, msg.Media)
-		}
+	if len(history) == 0 {
+		t.Fatal("expected user message to remain in session history")
+	}
+	if len(history[0].Media) == 0 {
+		t.Fatalf("history[0].Media = %v, want original media preserved", history[0].Media)
+	}
+}
+
+func TestAgentLoop_LoadImageFollowUpRoutesToImageModel(t *testing.T) {
+	workspace := t.TempDir()
+	pngPath := filepath.Join(workspace, "sample.png")
+	pngBytes := []byte{
+		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+		0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02,
+		0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+	}
+	if err := os.WriteFile(pngPath, pngBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), responseTimeout)
-	defer cancel2()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         workspace,
+				ModelName:         "text-model",
+				ImageModel:        "vision-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 3,
+			},
+		},
+		Tools: config.ToolsConfig{
+			LoadImage: config.ToolConfig{Enabled: true},
+		},
+		ModelList: []*config.ModelConfig{
+			{ModelName: "text-model", Model: "openai/text-model"},
+			{ModelName: "vision-model", Model: "openai/vision-model"},
+		},
+	}
 
-	resp2, err := al.processMessage(timeoutCtx2, testInboundMessage(bus.InboundMessage{
+	msgBus := bus.NewMessageBus()
+	planner := &loadImagePlanningProvider{path: pngPath}
+	al := NewAgentLoop(cfg, msgBus, planner)
+	al.SetMediaStore(media.NewFileMediaStore())
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	if len(agent.ImageCandidates) != 1 {
+		t.Fatalf("len(ImageCandidates) = %d, want 1", len(agent.ImageCandidates))
+	}
+
+	visionProvider := &visionAnswerProvider{}
+	agent.CandidateProviders[providers.ModelKey("openai", "vision-model")] = visionProvider
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	resp, err := al.processMessage(timeoutCtx, testInboundMessage(bus.InboundMessage{
 		Context: bus.InboundContext{
 			Channel:   "telegram",
 			ChatID:    "chat1",
 			ChatType:  "direct",
 			SenderID:  "user1",
-			MessageID: "m2",
+			MessageID: "m1",
 		},
-		Content:    "hello again",
-		SessionKey: sessionKey,
+		Content:    "describe the image you load",
+		SessionKey: "agent:main:telegram:direct:user1",
 	}))
 	if err != nil {
-		t.Fatalf("processMessage() second call error = %v", err)
+		t.Fatalf("processMessage() error = %v", err)
 	}
-	if resp2 != "ok" {
-		t.Fatalf("second response = %q, want %q", resp2, "ok")
+	if resp != "vision answer" {
+		t.Fatalf("response = %q, want %q", resp, "vision answer")
 	}
-	if provider.calls != 3 {
-		t.Fatalf("calls after second turn = %d, want %d", provider.calls, 3)
+	if planner.calls != 1 {
+		t.Fatalf("planner calls = %d, want %d", planner.calls, 1)
 	}
-	if !slices.Equal(provider.mediaSeen, []bool{true, false, false}) {
-		t.Fatalf("mediaSeen = %v, want %v", provider.mediaSeen, []bool{true, false, false})
+	if visionProvider.calls != 1 {
+		t.Fatalf("visionProvider calls = %d, want %d", visionProvider.calls, 1)
+	}
+	if !slices.Equal(visionProvider.models, []string{"vision-model"}) {
+		t.Fatalf("visionProvider models = %v, want %v", visionProvider.models, []string{"vision-model"})
+	}
+	if !slices.Equal(visionProvider.mediaSeen, []bool{true}) {
+		t.Fatalf("visionProvider mediaSeen = %v, want %v", visionProvider.mediaSeen, []bool{true})
+	}
+}
+
+func TestAgentLoop_LoadImageFollowUpWithoutImageModelFailsClearly(t *testing.T) {
+	workspace := t.TempDir()
+	pngPath := filepath.Join(workspace, "sample.png")
+	pngBytes := []byte{
+		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+		0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02,
+		0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+	}
+	if err := os.WriteFile(pngPath, pngBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         workspace,
+				ModelName:         "text-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 3,
+			},
+		},
+		Tools: config.ToolsConfig{
+			LoadImage: config.ToolConfig{Enabled: true},
+		},
+		ModelList: []*config.ModelConfig{
+			{ModelName: "text-model", Model: "openai/text-model"},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	planner := &loadImagePlanningProvider{
+		path: pngPath,
+		followUpErr: fmt.Errorf(
+			`API request failed: Status: 404 Body: {"error":{"message":"No endpoints found that support image input"}}`,
+		),
+	}
+	al := NewAgentLoop(cfg, msgBus, planner)
+	al.SetMediaStore(media.NewFileMediaStore())
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	resp, err := al.processMessage(timeoutCtx, testInboundMessage(bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel:   "telegram",
+			ChatID:    "chat1",
+			ChatType:  "direct",
+			SenderID:  "user1",
+			MessageID: "m1",
+		},
+		Content:    "describe the image you load",
+		SessionKey: "agent:main:telegram:direct:user1",
+	}))
+	if err == nil {
+		t.Fatal("processMessage() error = nil, want vision unsupported failure")
+	}
+	if resp != "" {
+		t.Fatalf("response = %q, want empty response on error", resp)
+	}
+	if !strings.Contains(err.Error(), `active model "text-model" does not support image input`) {
+		t.Fatalf("error = %q, want clear vision unsupported guidance", err.Error())
+	}
+	if planner.calls != 2 {
+		t.Fatalf("planner calls = %d, want %d", planner.calls, 2)
 	}
 }
 

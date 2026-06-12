@@ -64,6 +64,9 @@ func (p *Pipeline) CallLLM(
 		exec.providerToolDefs = nil
 		ts.markGracefulTerminalUsed()
 	}
+	if err := p.routeMediaTurn(ts, exec); err != nil {
+		return ControlBreak, err
+	}
 
 	exec.llmOpts = map[string]any{
 		"max_tokens":       ts.agent.MaxTokens,
@@ -170,36 +173,62 @@ func (p *Pipeline) CallLLM(
 			return response, streamErr
 		}
 
-		if len(exec.activeCandidates) > 1 && p.Fallback != nil {
-			fbResult, fbErr := p.Fallback.ExecuteCandidate(
-				providerCtx,
+		runCandidate := func(
+			ctx context.Context,
+			candidate providers.FallbackCandidate,
+		) (*providers.LLMResponse, error) {
+			candidateProvider, err := providerForFallbackCandidate(
+				ts.agent,
+				exec.activeProvider,
 				exec.activeCandidates,
-				func(ctx context.Context, candidate providers.FallbackCandidate) (*providers.LLMResponse, error) {
-					candidateProvider, err := providerForFallbackCandidate(
-						ts.agent,
-						exec.activeProvider,
-						exec.activeCandidates,
-						candidate.Provider,
-						candidate.Model,
-					)
-					if err != nil {
-						return nil, err
-					}
-					callOpts := shallowCloneLLMOptions(exec.llmOpts)
-					delete(callOpts, "thinking_level")
-					candidateCfg := resolveActiveModelConfig(
-						p.Cfg,
-						ts.agent.Workspace,
-						[]providers.FallbackCandidate{candidate},
-						candidate.Model,
-						p.Cfg.Agents.Defaults.Provider,
-					)
-					candidateThinking := thinkingSettingsFromModelConfig(candidateCfg)
-					applyThinkingOption(callOpts, candidateProvider, candidateThinking, true, ts.agent.ID)
-					exec.suppressReasoning = shouldSuppressReasoningFor(candidateThinking)
-					return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, candidate.Model, callOpts)
-				},
+				candidate.Provider,
+				candidate.Model,
 			)
+			if err != nil {
+				return nil, err
+			}
+			callOpts := shallowCloneLLMOptions(exec.llmOpts)
+			delete(callOpts, "thinking_level")
+			candidateCfg := resolveActiveModelConfig(
+				p.Cfg,
+				ts.agent.Workspace,
+				[]providers.FallbackCandidate{candidate},
+				candidate.Model,
+				p.Cfg.Agents.Defaults.Provider,
+			)
+			candidateThinking := thinkingSettingsFromModelConfig(candidateCfg)
+			applyThinkingOption(callOpts, candidateProvider, candidateThinking, true, ts.agent.ID)
+			exec.suppressReasoning = shouldSuppressReasoningFor(candidateThinking)
+			return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, candidate.Model, callOpts)
+		}
+
+		if len(exec.activeCandidates) > 1 && p.Fallback != nil {
+			var (
+				fbResult *providers.FallbackResult
+				fbErr    error
+			)
+			if hasMediaRefs(messagesForCall) {
+				fbResult, fbErr = p.Fallback.ExecuteImage(
+					providerCtx,
+					exec.activeCandidates,
+					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
+						candidate := providers.FallbackCandidate{Provider: provider, Model: model}
+						for _, configured := range exec.activeCandidates {
+							if configured.Provider == provider && configured.Model == model {
+								candidate = configured
+								break
+							}
+						}
+						return runCandidate(ctx, candidate)
+					},
+				)
+			} else {
+				fbResult, fbErr = p.Fallback.ExecuteCandidate(
+					providerCtx,
+					exec.activeCandidates,
+					runCandidate,
+				)
+			}
 			if fbErr != nil {
 				return nil, fbErr
 			}
@@ -250,33 +279,11 @@ func (p *Pipeline) CallLLM(
 			break
 		}
 
-		// Retry without media if vision is unsupported
-		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) && retry < maxRetries {
-			al.emitEvent(
-				runtimeevents.KindAgentLLMRetry,
-				ts.eventMeta("runTurn", "turn.llm.retry"),
-				LLMRetryPayload{
-					Attempt:    retry + 1,
-					MaxRetries: maxRetries,
-					Reason:     "vision_unsupported",
-					Error:      err.Error(),
-					Backoff:    0,
-				},
+		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) {
+			return ControlBreak, visionUnsupportedModelError(
+				exec.llmModelName,
+				len(ts.agent.ImageCandidates) > 0,
 			)
-			logger.WarnCF("agent", "Vision unsupported, retrying without media", map[string]any{
-				"error": err.Error(),
-				"retry": retry,
-			})
-			exec.callMessages = stripMessageMedia(exec.callMessages)
-			if !ts.opts.NoHistory {
-				exec.history = stripMessageMedia(exec.history)
-				ts.agent.Sessions.SetHistory(ts.sessionKey, exec.history)
-				for i := range ts.persistedMessages {
-					ts.persistedMessages[i].Media = nil
-				}
-				ts.refreshRestorePointFromSession(ts.agent)
-			}
-			continue
 		}
 
 		errMsg := strings.ToLower(err.Error())
